@@ -29,42 +29,46 @@ eCAL::protobuf::CPublisher<vio_output_proto::VIOOutput> publisher;
 
 std::mutex mtx;
 std::condition_variable cond_var; 
-
-size_t count = 0;
-bool spin_vio = false;
+std::vector<vio_input_proto::IMUCamVec> input_buffer;
 vio_input_proto::IMUCamData cam_buffer;
-uint64 last_cam_time = 0;
 
 
 // define a subscriber callback function
 void ReceiveVIOInput(const vio_input_proto::IMUCamVec& vio_input) {
+	input_buffer.push_back(vio_input);
+
+	if (mtx.try_lock() == false) {
+		std::cout << "CONSUMER BUSY" << std::endl;
+		return;
+	}
+
+	auto curr_vio_input = input_buffer.front();
+	std::cout << "CONSUMING INPUT: " << curr_vio_input.num() << std::endl;
+
 	for (int i = 0; i < vio_input.imu_cam_data_size(); i++) {
-		vio_input_proto::IMUCamData curr_data = vio_input.imu_cam_data(i);
+		vio_input_proto::IMUCamData curr_data = curr_vio_input.imu_cam_data(i);
+		cam_buffer = curr_data;
 
 		VIO::Vector6 imu_raw_vals;
 		imu_raw_vals << curr_data.linear_accel().x(), curr_data.linear_accel().y(), curr_data.linear_accel().z(), curr_data.angular_vel().x(), curr_data.angular_vel().y(), curr_data.angular_vel().z();
 
-		// std::cout << imu_raw_vals[0] << " " << imu_raw_vals[1] << " " << imu_raw_vals[2] << " " << imu_raw_vals[3] << " " << imu_raw_vals[4] << " " << imu_raw_vals[5] << std::endl;
-
-		// assert(curr_data.timestamp() > last_cam_time);
-        // last_cam_time = curr_data.timestamp();
-		// std::cout << "Received IMU data at time: " << curr_data.timestamp() << std::endl;
-
+		// std::cout << curr_data.timestamp() << ", " << curr_data.linear_accel().x() << ", " << curr_data.linear_accel().y() << ", " << curr_data.linear_accel().z() << ", " << curr_data.angular_vel().x() << ", " << curr_data.angular_vel().y() << ", " << curr_data.angular_vel().z() << std::endl;
+		
 		kimera_pipeline.fillSingleImuQueue(VIO::ImuMeasurement(
 			curr_data.timestamp(), 
 			imu_raw_vals
 		));
 
 		// std::cout << "Received IMU data: " << count << std::endl;
-		count++;
-
 		if (curr_data.rows() != -1 && curr_data.cols() != -1) {
-			std::vector<uint8_t> img0_vec(curr_data.img0_data().begin(),curr_data.img0_data().end());
-			std::vector<uint8_t> img1_vec(curr_data.img1_data().begin(),curr_data.img1_data().end());
+			// std::vector<uint8_t> img0_vec(curr_data.img0_data().begin(),curr_data.img0_data().end());
+			// std::vector<uint8_t> img1_vec(curr_data.img1_data().begin(),curr_data.img1_data().end());
 
-			// Verified that these dont have to be pointers
-			cv::Mat img0(curr_data.rows(), curr_data.cols(), CV_8UC1, img0_vec.data());
-			cv::Mat img1(curr_data.rows(), curr_data.cols(), CV_8UC1, img1_vec.data());
+			unsigned char* img0_data = (unsigned char*) curr_data.img0_data().c_str();
+			unsigned char* img1_data = (unsigned char*) curr_data.img1_data().c_str();
+
+			cv::Mat img0(curr_data.rows(), curr_data.cols(), 0, img0_data);
+			cv::Mat img1(curr_data.rows(), curr_data.cols(), 0, img1_data);
 
 			VIO::CameraParams left_cam_info = kimera_pipeline_params.camera_params_.at(0);
 			VIO::CameraParams right_cam_info = kimera_pipeline_params.camera_params_.at(1);
@@ -81,13 +85,23 @@ void ReceiveVIOInput(const vio_input_proto::IMUCamVec& vio_input) {
 				right_cam_info, 
 				img1)
 			);
-
-			count = 0;
-			spin_vio = true;
-			std::lock_guard<std::mutex> lock(mtx);
-			cond_var.notify_one();
 		}
 	}
+
+	input_buffer.erase(input_buffer.begin());
+	mtx.unlock();
+
+	auto f = []() {
+		mtx.lock();
+
+		std::cout << "RUNNING CAM" << std::endl;
+		kimera_pipeline.spin();
+
+		mtx.unlock();
+	};
+
+	std::thread kimeara_thread(f);
+	kimeara_thread.detach();
 }
 
 
@@ -172,8 +186,6 @@ void pose_callback(const std::shared_ptr<VIO::BackendOutput>& vio_output) {
 	vio_output_params->set_allocated_slow_pose(slow_pose);
 	vio_output_params->set_allocated_imu_int_input(imu_int_input);
 
-	// std::cout << "X: " << vio_output_params->slow_pose().position().x() << " Y: " << vio_output_params->slow_pose().position().y() << " Z: " << vio_output_params->slow_pose().position().z() << std::endl;
-
 	publisher.Send(*vio_output_params);
 	delete vio_output_params;
 }
@@ -202,12 +214,6 @@ int main(int argc, char **argv)
 		<vio_output_proto::VIOOutput>("vio_output");
 
 	while (eCAL::Ok()) {
-		std::unique_lock<std::mutex> lock(mtx);
-		cond_var.wait(lock, []{return spin_vio;});
-		spin_vio = false;
-
-		std::cout << "RUNNING CAM" << std::endl;
-		kimera_pipeline.spin();
 	}
 
 	eCAL::Finalize();
